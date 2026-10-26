@@ -50,12 +50,14 @@ pub enum Event {
 
     /// The wallet balance has been updated.
     ///
-    /// This event is triggered after each trade or fee deduction.
-    /// It contains the current state of the wallet.
+    /// Emitted once per candle, at the bar close, by [`crate::Backtest::run`] — not
+    /// once per trade. A per-trade sample sees only the bars where something happened,
+    /// so an intra-trade excursion is invisible and the open notional reads as a
+    /// realised loss; a per-bar sample is the equity curve.
     WalletUpdate {
         /// Moment
         datetime: DateTime<Utc>,
-        /// Realized profit and loss.
+        /// Unrealized profit and loss at this mark.
         pnl: f64,
         /// Total fees paid.
         fees: f64,
@@ -63,7 +65,9 @@ pub enum Event {
         free: f64,
         /// Funds locked in open positions.
         locked: f64,
-        /// Available balance.
+        /// Mark-to-market equity: cash + the entry notional of the positions still
+        /// open + the unrealized pnl at this close. **Not** cash: `Wallet::balance()`
+        /// is cash, and opening a position moves notional out of it.
         balance: f64,
     },
 }
@@ -74,7 +78,7 @@ impl From<(DateTime<Utc>, &Wallet)> for Event {
             datetime,
             locked: value.locked(),
             fees: value.fees_paid(),
-            balance: value.balance(),
+            balance: value.total_balance(),
             pnl: value.unrealized_pnl(),
             free: value.free_balance().expect("should give the free balance"),
         }
@@ -421,4 +425,97 @@ fn win_rate_all_winning() {
     let events = vec![Event::DelPosition(DateTime::default(), winning_position)];
     let metrics = Metrics::new(events, 10000.0, 0.0, 0.0, 0.0);
     assert_eq!(metrics.win_rate(), 100.0); // 1 win out of 1 trade
+}
+
+// ---- M1: the drawdown must be read off a per-bar mark-to-market equity curve ----
+//
+// `run` samples the wallet once per bar; `WalletUpdate.balance` is equity
+// (cash + entry notional of the open positions + unrealized at that close). The
+// cases below are the audit's: the same 90%-notional position on a +9% path, a flat
+// path and a −45% path. Before the fix all three reported 90.00% — the position size,
+// not the loss — because the sample was taken per trade, when cash had already paid
+// the notional out.
+
+#[cfg(test)]
+/// 1000.0 account, `qty` bought at 100 on bar 0 and held to the last bar.
+fn hold_through(closes: &[f64], qty: f64) -> Backtest {
+    use chrono::{Duration, TimeZone};
+
+    let candles: Vec<Candle> = closes
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| {
+            let t = Utc.timestamp_opt(1_600_000_000 + i as i64 * 3600, 0).unwrap();
+            CandleBuilder::builder()
+                .open(c)
+                .high(c.max(100.0))
+                .low(c.min(100.0))
+                .close(c)
+                .volume(1.0)
+                .bid(0.0)
+                .open_time(t)
+                .close_time(t + Duration::hours(1))
+                .build()
+                .unwrap()
+        })
+        .collect();
+
+    let mut bt = Backtest::new(std::sync::Arc::from(candles), 1000.0, None).unwrap();
+    let mut i = 0;
+    bt.run(|bt, candle| {
+        if i == 0 {
+            bt.place_order(candle, (OrderType::Market(100.0), qty, OrderSide::Buy).into())?;
+        }
+        i += 1;
+        Ok(())
+    })
+    .unwrap();
+    bt
+}
+
+#[cfg(test)]
+#[test]
+fn max_drawdown_marks_a_held_position_to_market() {
+    // 900 of notional on a 1000 account = 90%; price 100 -> 50 is −45% of the account.
+    let bt = hold_through(&[100.0, 100.0, 100.0, 50.0], 9.0);
+    let m = Metrics::from(&bt);
+    assert_eq!(bt.total_balance(), 550.0);
+    assert!((m.max_drawdown() - 45.0).abs() < 1e-9, "dd {}", m.max_drawdown());
+}
+
+#[cfg(test)]
+#[test]
+fn max_drawdown_flat_path_with_a_held_position_is_zero() {
+    let bt = hold_through(&[100.0; 5], 9.0);
+    let m = Metrics::from(&bt);
+    assert_eq!(bt.total_balance(), 1000.0);
+    assert_eq!(m.max_drawdown(), 0.0);
+}
+
+#[cfg(test)]
+#[test]
+fn max_drawdown_rising_path_with_a_held_position_is_zero() {
+    let bt = hold_through(&[100.0, 105.0, 110.0], 9.0);
+    let m = Metrics::from(&bt);
+    assert_eq!(bt.total_balance(), 1090.0);
+    assert_eq!(m.max_drawdown(), 0.0);
+}
+
+#[cfg(test)]
+#[test]
+fn wallet_equity_values_the_open_position() {
+    let mut wallet = Wallet::new(1000.0).unwrap();
+    wallet.lock(900.0).unwrap();
+    wallet.sub(900.0).unwrap(); // cash 100, notional 900 held
+    wallet.add_open_cost(900.0);
+    assert_eq!(wallet.balance(), 100.0);
+    assert_eq!(wallet.equity(), 1000.0);
+
+    wallet.set_unrealized_pnl(-450.0); // the −45% mark
+    assert_eq!(wallet.equity(), 550.0);
+
+    wallet.sub_open_cost(900.0); // closed: the notional came back as cash
+    wallet.set_unrealized_pnl(0.0);
+    assert_eq!(wallet.balance(), 100.0);
+    assert_eq!(wallet.equity(), 100.0);
 }

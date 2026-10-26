@@ -7,6 +7,13 @@ pub struct Wallet {
     fees: f64,
     locked: f64,
     balance: f64,
+    /// Entry notional (`price * quantity`) of the positions still open.
+    ///
+    /// Opening a position moves cash out of `balance` but not out of the account:
+    /// the money is still there, holding a mark. Without this term `balance` alone
+    /// reads as if opening a position had spent the notional for good, which is
+    /// what made `max_drawdown` report the position size instead of the loss.
+    open_cost: f64,
     unrealized_pnl: f64,
     initial_balance: f64,
 }
@@ -23,6 +30,7 @@ impl Wallet {
             balance,
             fees: 0.0,
             locked: 0.0,
+            open_cost: 0.0,
             unrealized_pnl: 0.0,
             initial_balance: balance,
         })
@@ -48,14 +56,30 @@ impl Wallet {
         self.fees
     }
 
-    /// Returns the balance.
+    /// Returns the balance. This is **cash**, not equity: opening a position moves
+    /// notional out of it. Use [`Wallet::equity`] to value the account.
     pub fn balance(&self) -> f64 {
         self.balance
     }
 
-    /// Returns the total balance.
+    /// Returns the entry notional of the positions still open.
+    pub fn open_cost(&self) -> f64 {
+        self.open_cost
+    }
+
+    /// Returns the mark-to-market equity of the account:
+    /// `cash + entry notional of open positions + unrealized pnl`.
+    ///
+    /// With no open position this is the cash balance. With one, it is what the
+    /// account is worth at the last mark — the only series a drawdown can be
+    /// measured on.
+    pub fn equity(&self) -> f64 {
+        self.balance + self.open_cost + self.unrealized_pnl
+    }
+
+    /// Returns the total balance, i.e. [`Wallet::equity`].
     pub fn total_balance(&self) -> f64 {
-        self.balance + self.unrealized_pnl
+        self.equity()
     }
 
     /// Returns the free balance (available for new trades).
@@ -113,6 +137,16 @@ impl Wallet {
         Ok(())
     }
 
+    /// Adds the entry notional of a position that has just been opened.
+    pub(crate) fn add_open_cost(&mut self, amount: f64) {
+        self.open_cost += amount;
+    }
+
+    /// Removes the entry notional of a position that has just been closed.
+    pub(crate) fn sub_open_cost(&mut self, amount: f64) {
+        self.open_cost -= amount;
+    }
+
     /// Updates the unrealized P&L.
     pub(crate) fn set_unrealized_pnl(&mut self, pnl: f64) {
         self.unrealized_pnl = pnl;
@@ -130,6 +164,7 @@ impl Wallet {
     pub(crate) fn reset(&mut self) {
         self.fees = 0.0;
         self.locked = 0.0;
+        self.open_cost = 0.0;
         self.unrealized_pnl = 0.0;
         self.balance = self.initial_balance;
     }

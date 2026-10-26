@@ -215,12 +215,10 @@ impl Backtest {
     pub fn place_order(&mut self, _candle: &Candle, order: Order) -> Result<()> {
         self.wallet.lock(order.cost()?)?;
         self.orders.push_back(order);
+        // no wallet event here: the wallet is sampled once per bar in `run`, and an
+        // order sitting in the queue has not moved cash anywhere
         #[cfg(feature = "metrics")]
-        {
-            let open_time = _candle.open_time();
-            self.events.push(Event::from((open_time, &self.wallet)));
-            self.events.push(Event::AddOrder(open_time, order));
-        }
+        self.events.push(Event::AddOrder(_candle.open_time(), order));
         Ok(())
     }
 
@@ -268,31 +266,27 @@ impl Backtest {
         }
         self.wallet.unlock(order.cost()?)?;
         #[cfg(feature = "metrics")]
-        {
-            let open_time = _candle.open_time();
-            self.events.push(Event::DelOrder(open_time, *order));
-            self.events.push(Event::from((open_time, &self.wallet)));
-        }
+        self.events.push(Event::DelOrder(_candle.open_time(), *order));
         Ok(())
     }
 
     /// Opens a new position.
     fn open_position(&mut self, _candle: &Candle, position: Position) -> Result<()> {
-        self.wallet.sub(position.cost()?)?;
+        let cost = position.cost()?;
+        self.wallet.sub(cost)?;
+        // the cash left `balance` but not the account: it is now a position held at cost,
+        // marked to the bar close by `execute_positions`
+        self.wallet.add_open_cost(cost);
         if let Some((market_fee, limit_fee)) = self.market_fees {
             if position.is_market_type() {
-                self.wallet.sub_fees(position.cost()? * market_fee)?;
+                self.wallet.sub_fees(cost * market_fee)?;
             } else {
-                self.wallet.sub_fees(position.cost()? * limit_fee)?;
+                self.wallet.sub_fees(cost * limit_fee)?;
             };
         }
         self.positions.push_back(position);
         #[cfg(feature = "metrics")]
-        {
-            let open_time = _candle.open_time();
-            self.events.push(Event::from((open_time, &self.wallet)));
-            self.events.push(Event::AddPosition(open_time, position));
-        }
+        self.events.push(Event::AddPosition(_candle.open_time(), position));
         Ok(())
     }
 
@@ -361,6 +355,8 @@ impl Backtest {
         let pnl = position.estimate_pnl(exit_price)?;
         let total_amount = pnl + position.cost()?;
         self.wallet.add(total_amount)?;
+        // the position leaves the book at its exit value; cash arrived instead
+        self.wallet.sub_open_cost(position.cost()?);
         self.wallet.sub_pnl(total_amount);
         if let Some((market_fee, limit_fee)) = self.market_fees {
             if position.is_market_type() {
@@ -373,9 +369,7 @@ impl Backtest {
         {
             let mut _position = *position;
             _position.set_exit_price(exit_price)?;
-            let open_time = _candle.open_time();
-            self.events.push(Event::from((open_time, &self.wallet)));
-            self.events.push(Event::DelPosition(open_time, _position));
+            self.events.push(Event::DelPosition(_candle.open_time(), _position));
         }
         Ok(pnl)
     }
@@ -568,6 +562,10 @@ impl Backtest {
             strategy(self, candle)?;
             self.execute_orders(candle)?;
             self.execute_positions(candle)?;
+            // one wallet sample per bar, at the bar close: the equity series the
+            // drawdown and the per-bar returns are read from
+            #[cfg(feature = "metrics")]
+            self.events.push(Event::from((candle.open_time(), &self.wallet)));
         }
         Ok(())
     }
@@ -896,7 +894,7 @@ mod tests {
 
             assert!(!bt.positions.is_empty());
             assert_eq!(bt.balance(), 899.0);
-            assert_eq!(bt.total_balance(), 899.0);
+            assert_eq!(bt.total_balance(), 999.0);
             assert_eq!(bt.free_balance().unwrap(), 1000.0 - expected_total_cost);
 
             let candle = bt.next().unwrap();
@@ -933,7 +931,7 @@ mod tests {
 
         assert!(!bt.positions.is_empty());
         assert_eq!(bt.balance(), 899.0);
-        assert_eq!(bt.total_balance(), 899.0);
+        assert_eq!(bt.total_balance(), 999.0);
         assert_eq!(bt.free_balance().unwrap(), 1000.0 - expected_total_cost);
 
         let candle = bt.next().unwrap();
@@ -1022,7 +1020,7 @@ mod tests {
         assert!(bt.orders.is_empty());
         assert!(!bt.positions.is_empty());
         assert_eq!(bt.balance(), 900.0);
-        assert_eq!(bt.total_balance(), 900.0);
+        assert_eq!(bt.total_balance(), 1000.0);
         assert_eq!(bt.free_balance().unwrap(), 900.0);
 
         bt.execute_positions(&candle).unwrap();
@@ -1034,7 +1032,7 @@ mod tests {
 
         assert!(!bt.positions.is_empty());
         assert_eq!(bt.balance(), 900.0);
-        assert_eq!(bt.total_balance(), 910.0); // balance + p&l
+        assert_eq!(bt.total_balance(), 1010.0); // cash 900 + notional 100 + p&l 10
         assert_eq!(bt.free_balance().unwrap(), 900.0);
 
         // next tick
@@ -1071,7 +1069,7 @@ mod tests {
         assert!(bt.orders.is_empty());
         assert!(!bt.positions.is_empty());
         assert_eq!(bt.balance(), 860.0);
-        assert_eq!(bt.total_balance(), 860.0);
+        assert_eq!(bt.total_balance(), 1000.0);
         assert_eq!(bt.free_balance().unwrap(), 860.0);
 
         bt.execute_positions(&candle).unwrap();
@@ -1083,7 +1081,7 @@ mod tests {
 
         assert!(!bt.positions.is_empty());
         assert_eq!(bt.balance(), 860.0);
-        assert_eq!(bt.total_balance(), 850.0); // balance + p&l
+        assert_eq!(bt.total_balance(), 990.0); // cash 860 + notional 140 + p&l -10
         assert_eq!(bt.free_balance().unwrap(), 860.0);
 
         // next tick
@@ -1120,7 +1118,7 @@ mod tests {
         assert!(bt.orders.is_empty());
         assert!(!bt.positions.is_empty());
         assert_eq!(bt.balance(), 860.0);
-        assert_eq!(bt.total_balance(), 860.0);
+        assert_eq!(bt.total_balance(), 1000.0);
         assert_eq!(bt.free_balance().unwrap(), 860.0);
 
         bt.execute_positions(&candle).unwrap();
@@ -1132,7 +1130,7 @@ mod tests {
 
         assert!(!bt.positions.is_empty());
         assert_eq!(bt.balance(), 860.0);
-        assert_eq!(bt.total_balance(), 870.0); // balance + p&l
+        assert_eq!(bt.total_balance(), 1010.0); // cash 860 + notional 140 + p&l 10
         assert_eq!(bt.free_balance().unwrap(), 860.0);
 
         // next tick
@@ -1169,7 +1167,7 @@ mod tests {
         assert!(bt.orders.is_empty());
         assert!(!bt.positions.is_empty());
         assert_eq!(bt.balance(), 900.0);
-        assert_eq!(bt.total_balance(), 900.0);
+        assert_eq!(bt.total_balance(), 1000.0);
         assert_eq!(bt.free_balance().unwrap(), 900.0);
 
         bt.execute_positions(&candle).unwrap();
@@ -1181,7 +1179,7 @@ mod tests {
 
         assert!(!bt.positions.is_empty());
         assert_eq!(bt.balance(), 900.0);
-        assert_eq!(bt.total_balance(), 890.0); // balance + p&l
+        assert_eq!(bt.total_balance(), 990.0); // cash 900 + notional 100 + p&l -10
         assert_eq!(bt.free_balance().unwrap(), 900.0);
 
         // next tick
@@ -1213,7 +1211,7 @@ mod tests {
 
         assert!(!bt.positions.is_empty());
         assert_eq!(bt.balance(), 900.0);
-        assert_eq!(bt.total_balance(), 900.0);
+        assert_eq!(bt.total_balance(), 1000.0);
         assert_eq!(bt.free_balance().unwrap(), 900.0);
 
         bt.execute_positions(&candle).unwrap();
@@ -1225,7 +1223,7 @@ mod tests {
 
         assert!(!bt.positions.is_empty());
         assert_eq!(bt.balance(), 900.0);
-        assert_eq!(bt.total_balance(), 908.0);
+        assert_eq!(bt.total_balance(), 1008.0);
         assert_eq!(bt.free_balance().unwrap(), 900.0);
 
         // next tick
@@ -1233,7 +1231,7 @@ mod tests {
         bt.execute_positions(&candle).unwrap();
         assert!(!bt.positions.is_empty());
         assert_eq!(bt.balance(), 900.0);
-        assert_eq!(bt.total_balance(), 935.0);
+        assert_eq!(bt.total_balance(), 1035.0);
         assert_eq!(bt.free_balance().unwrap(), 900.0);
 
         // next tick
@@ -1264,7 +1262,7 @@ mod tests {
 
         assert!(!bt.positions.is_empty());
         assert_eq!(bt.balance(), 900.0);
-        assert_eq!(bt.total_balance(), 900.0);
+        assert_eq!(bt.total_balance(), 1000.0);
         assert_eq!(bt.free_balance().unwrap(), 900.0);
 
         bt.execute_positions(&candle).unwrap();
