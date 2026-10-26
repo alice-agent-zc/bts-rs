@@ -20,6 +20,13 @@ pub struct Position {
     side: PositionSide,
     #[cfg(feature = "metrics")]
     exit_price: Option<f64>,
+    /// Fees paid to open and to close this position, in account currency.
+    ///
+    /// The wallet is charged the fees separately (`Wallet::fees_paid`), so a metric
+    /// that scores trades on `pnl()` alone scores them gross. Carrying the charge on
+    /// the trade is what makes `profit_factor` and `win_rate` net.
+    #[cfg(feature = "metrics")]
+    fees: f64,
 }
 
 impl PartialEq for Position {
@@ -34,6 +41,8 @@ impl From<Order> for Position {
             id: random_id(),
             #[cfg(feature = "metrics")]
             exit_price: None,
+            #[cfg(feature = "metrics")]
+            fees: 0.0,
             order: value,
             side: match value.side() {
                 OrderSide::Buy => PositionSide::Long,
@@ -83,6 +92,25 @@ impl Position {
     pub fn pnl(&self) -> Result<f64> {
         let exit_price = self.exit_price.ok_or(Error::ExitPrice(0.0))?;
         self.estimate_pnl(exit_price)
+    }
+
+    #[cfg(feature = "metrics")]
+    /// Returns the fees paid to open and close this position.
+    pub fn fees(&self) -> f64 {
+        self.fees
+    }
+
+    #[cfg(feature = "metrics")]
+    /// Adds a fee charge to this position's running total.
+    pub(crate) fn add_fees(&mut self, amount: f64) {
+        self.fees += amount;
+    }
+
+    #[cfg(feature = "metrics")]
+    /// Returns the gross P&L less every fee paid on this position — the number a
+    /// trade is actually worth.
+    pub fn net_pnl(&self) -> Result<f64> {
+        Ok(self.pnl()? - self.fees)
     }
 
     /// Returns the estimated profit and loss if it is closed at the `exit_price`.

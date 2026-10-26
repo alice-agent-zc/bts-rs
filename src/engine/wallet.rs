@@ -152,14 +152,6 @@ impl Wallet {
         self.unrealized_pnl = pnl;
     }
 
-    /// Subtracts the given amount from the wallet's unrealized P&L.
-    ///
-    /// This function is used when a position's unrealized P&L needs to be adjusted,
-    /// typically when a position is closed and its P&L becomes realized.
-    pub(crate) fn sub_pnl(&mut self, amount: f64) {
-        self.unrealized_pnl -= amount;
-    }
-
     /// Resets the wallet to its initial balance.
     pub(crate) fn reset(&mut self) {
         self.fees = 0.0;

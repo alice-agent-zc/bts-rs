@@ -101,10 +101,14 @@ pub struct Metrics {
 
 impl From<&Backtest> for Metrics {
     fn from(value: &Backtest) -> Self {
+        // `total_balance()` is equity, not cash: a run that ends holding a position has
+        // spent cash on notional that is still worth something, and reading cash here
+        // reported 920.00 for an account worth 1020.00 (M5)
+        let equity = value.total_balance();
         Self {
             fees: value.fees_paid(),
-            balance: value.balance(),
-            pnl: value.unrealized_pnl(),
+            balance: equity,
+            pnl: equity - value.initial_balance(),
             initial_balance: value.initial_balance(),
             events: value.events().cloned().collect(),
         }
@@ -133,7 +137,11 @@ impl Metrics {
         self.events.iter()
     }
 
-    /// Returns the balance.
+    /// Returns the balance — **equity** at the last mark, i.e. cash + the entry notional
+    /// of any position still open + its unrealized P&L, minus everything paid in fees.
+    ///
+    /// This is the number to rank on. `Wallet::balance()` is cash and moves when a
+    /// position opens; this does not.
     pub fn balance(&self) -> f64 {
         self.balance
     }
@@ -143,9 +151,174 @@ impl Metrics {
         self.fees
     }
 
-    /// Returns the profits and losses.
+    /// Returns the profit and loss: **equity − initial balance**, fees included.
+    ///
+    /// Not `unrealized_pnl`, which is zero on a closed book and is only the mark on
+    /// whatever is still open.
     pub fn pnl(&self) -> f64 {
         self.pnl
+    }
+
+    /// Returns the per-bar equity samples the risk metrics are computed from.
+    fn equity_curve(&self) -> Vec<f64> {
+        let mut curve = Vec::with_capacity(self.events.len());
+        for event in &self.events {
+            if let Event::WalletUpdate { balance, .. } = event {
+                curve.push(*balance);
+            }
+        }
+        curve
+    }
+
+    /// Returns the simple per-bar returns of the equity curve.
+    fn returns(&self) -> Vec<f64> {
+        let mut previous = self.initial_balance;
+        let mut returns = Vec::new();
+        for balance in self.equity_curve() {
+            if previous > 0.0 {
+                returns.push((balance - previous) / previous);
+            }
+            previous = balance;
+        }
+        returns
+    }
+
+    /// Returns the number of bars per year implied by the spacing of the equity
+    /// samples, or `None` when the stamps cannot tell (all identical, or fewer than
+    /// two of them) — in which case there is nothing to annualise to.
+    ///
+    /// Read off the data, not passed in: the same run scored at 4h and at 1h bars
+    /// annualises to the same number without the caller knowing the timeframe.
+    pub fn periods_per_year(&self) -> Option<f64> {
+        let mut stamps = Vec::new();
+        for event in &self.events {
+            if let Event::WalletUpdate { datetime, .. } = event {
+                stamps.push(*datetime);
+            }
+        }
+        if stamps.len() < 2 {
+            return None;
+        }
+        let mut deltas: Vec<f64> = stamps
+            .windows(2)
+            .map(|w| (w[1] - w[0]).num_milliseconds() as f64 / 1000.0)
+            .filter(|d| *d > 0.0)
+            .collect();
+        if deltas.len() * 2 < stamps.len() - 1 {
+            return None; // most steps do not advance: the spacing is not a bar clock
+        }
+        deltas.sort_by(f64::total_cmp);
+        let median = deltas[deltas.len() / 2];
+        if median <= 0.0 {
+            return None;
+        }
+        let year = 365.25 * 24.0 * 3600.0;
+        Some(year / median)
+    }
+
+    /// Computes the Sharpe ratio **per bar**: mean per-bar return over its standard
+    /// deviation, sample standard deviation (n−1), `risk_free_rate` de-annualised by
+    /// the bar spacing.
+    ///
+    /// Returns `0.0` when the ratio is undefined — fewer than two returns, or a zero
+    /// standard deviation. A flat run has a Sharpe of zero, not a NaN: there was no
+    /// risk and no return, and a NaN poisons every average it enters.
+    pub fn sharpe_ratio_per_bar(&self, risk_free_rate: f64) -> f64 {
+        let returns = self.returns();
+        if returns.len() < 2 {
+            return 0.0;
+        }
+        let n = returns.len() as f64;
+        let periods = self.periods_per_year();
+        let per_bar_rf = match periods {
+            Some(p) if p > 0.0 => risk_free_rate / p,
+            _ => 0.0,
+        };
+        let mean = returns.iter().sum::<f64>() / n;
+        let variance = returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / (n - 1.0);
+        let std_dev = variance.sqrt();
+        if !std_dev.is_finite() || std_dev <= f64::EPSILON {
+            return 0.0;
+        }
+        (mean - per_bar_rf) / std_dev
+    }
+
+    /// Computes the Sharpe ratio, **annualised**: the per-bar ratio times
+    /// `sqrt(periods_per_year)`, with the periods read off the bar spacing of the run.
+    ///
+    /// This is the number that is comparable across timeframes and across books.
+    /// `risk_free_rate` is the annualised risk-free return (0.0 for none).
+    pub fn sharpe_ratio(&self, risk_free_rate: f64) -> f64 {
+        let per_bar = self.sharpe_ratio_per_bar(risk_free_rate);
+        match self.periods_per_year() {
+            Some(periods) if periods > 0.0 => per_bar * periods.sqrt(),
+            // no clock in the stamps (a hand-built event list): the per-bar number is
+            // the honest answer, and the caller is told it is not annualised
+            _ => per_bar,
+        }
+    }
+
+    /// Returns the net P&L of every closed trade: gross `pnl()` less every fee paid
+    /// to open and to close it.
+    fn trade_nets(&self) -> Vec<f64> {
+        let mut nets = Vec::new();
+        for event in &self.events {
+            if let Event::DelPosition(_, position) = event {
+                if let Ok(net) = position.net_pnl() {
+                    nets.push(net);
+                }
+            }
+        }
+        nets
+    }
+
+    /// How close to zero a net trade P&L has to be before it counts as flat.
+    ///
+    /// A break-even trade comes out of the arithmetic at ~1e-13, not at 0.0, and a
+    /// 1e-13 "gain" against no losses would still print an infinite profit factor.
+    fn zero_tolerance(&self) -> f64 {
+        self.initial_balance.abs() * 1e-9
+    }
+
+    /// Computes the profit factor on **net** trade P&L: gross gains over gross losses,
+    /// after fees.
+    ///
+    /// `0.0` when no trade closed, or when every closed trade nets exactly zero — a
+    /// break-even trade is not an infinite profit factor. `INFINITY` only when there
+    /// are gains and no losses at all, which is a real (if unrepeatable) shape.
+    pub fn profit_factor(&self) -> f64 {
+        let mut total_gains = 0.0;
+        let mut total_losses = 0.0;
+        let eps = self.zero_tolerance();
+
+        for net in self.trade_nets() {
+            if net > eps {
+                total_gains += net;
+            } else if net < -eps {
+                total_losses += -net;
+            }
+        }
+
+        if total_gains == 0.0 {
+            return 0.0; // no trade, or nothing won
+        }
+        if total_losses == 0.0 {
+            return f64::INFINITY;
+        }
+
+        total_gains / total_losses
+    }
+
+    /// Computes the win rate as a percentage of trades that **netted** a profit after
+    /// fees. A trade whose gross gain is exactly eaten by its costs is not a win.
+    pub fn win_rate(&self) -> f64 {
+        let nets = self.trade_nets();
+        if nets.is_empty() {
+            return 0.0;
+        }
+        let eps = self.zero_tolerance();
+        let wins = nets.iter().filter(|net| **net > eps).count();
+        (wins as f64 / nets.len() as f64) * 100.0
     }
 
     /// Computes the maximum drawdown as a percentage.
@@ -174,71 +347,6 @@ impl Metrics {
         max_drawdown * 100.0
     }
 
-    /// Computes the profit factor.
-    pub fn profit_factor(&self) -> f64 {
-        let mut total_gains = 0.0;
-        let mut total_losses = 0.0;
-
-        for event in &self.events {
-            if let Event::DelPosition(_, position) = event {
-                let pnl = position.pnl().expect("pnl should be set the last exit price");
-                if pnl > 0.0 {
-                    total_gains += pnl;
-                } else {
-                    total_losses += pnl.abs();
-                }
-            }
-        }
-
-        if total_losses == 0.0 {
-            return f64::INFINITY;
-        }
-
-        total_gains / total_losses
-    }
-
-    /// Computes the Sharpe ratio, a measure of risk-adjusted return.
-    ///
-    /// A higher Sharpe ratio indicates better risk-adjusted performance.
-    /// `risk_free_rate` is the annualized risk-free return (e.g., 0.0 for simplicity).
-    pub fn sharpe_ratio(&self, risk_free_rate: f64) -> f64 {
-        let mut returns = Vec::new();
-        let mut previous_balance = self.initial_balance;
-
-        for event in &self.events {
-            if let Event::WalletUpdate { balance, .. } = event {
-                let return_pct = (*balance - previous_balance) / previous_balance;
-                returns.push(return_pct);
-                previous_balance = *balance;
-            }
-        }
-
-        let mean_return = returns.iter().sum::<f64>() / returns.len() as f64;
-        let std_dev = (returns.iter().map(|r| (r - mean_return).powi(2)).sum::<f64>() / returns.len() as f64).sqrt();
-
-        (mean_return - risk_free_rate) / std_dev
-    }
-
-    /// Computes the win rate as a percentage of winning trades.
-    pub fn win_rate(&self) -> f64 {
-        let mut winning_trades = 0;
-        let mut total_trades = 0;
-
-        for event in &self.events {
-            if let Event::DelPosition(_, position) = event {
-                total_trades += 1;
-                if position.pnl().expect("pnl should be set the last exit price") > 0.0 {
-                    winning_trades += 1;
-                }
-            }
-        }
-
-        if total_trades == 0 {
-            return 0.0;
-        }
-
-        (winning_trades as f64 / total_trades as f64) * 100.0
-    }
 }
 
 impl fmt::Display for Metrics {
@@ -252,7 +360,19 @@ impl fmt::Display for Metrics {
         writeln!(f, "")?;
         writeln!(f, "Max Drawdown: {:.2}%", self.max_drawdown())?;
         writeln!(f, "Profit Factor: {:.2}", self.profit_factor())?;
-        writeln!(f, "Sharpe Ratio (risk-free rate = 0.0): {:.2}", self.sharpe_ratio(0.0))?;
+        match self.periods_per_year() {
+            Some(periods) => writeln!(
+                f,
+                "Sharpe Ratio (annualised, {:.1} bars/yr, risk-free rate = 0.0): {:.2}",
+                periods,
+                self.sharpe_ratio(0.0)
+            )?,
+            None => writeln!(
+                f,
+                "Sharpe Ratio (per bar, no bar clock in the stamps, risk-free rate = 0.0): {:.4}",
+                self.sharpe_ratio(0.0)
+            )?,
+        }
         writeln!(f, "Win Rate: {:.2}%", self.win_rate())
     }
 }
@@ -343,7 +463,7 @@ fn profit_factor_no_losses() {
 #[test]
 fn profit_factor_no_trades() {
     let metrics = Metrics::new(vec![], 10000.0, 0.0, 0.0, 0.0);
-    assert_eq!(metrics.profit_factor(), f64::INFINITY); // No trades
+    assert_eq!(metrics.profit_factor(), 0.0); // no gains to divide: 0.0, not inf
 }
 
 #[cfg(test)]
@@ -394,8 +514,27 @@ fn sharpe_ratio() {
 #[test]
 fn sharpe_ratio_no_events() {
     let metrics = Metrics::new(vec![], 10000.0, 0.0, 0.0, 0.0);
-    // Sharpe ratio is undefined (division by zero), but in practice, it will return NaN
-    assert!(metrics.sharpe_ratio(0.0).is_nan());
+    // no returns -> no ratio. 0.0, not NaN: a NaN poisons every average it enters
+    assert_eq!(metrics.sharpe_ratio(0.0), 0.0);
+}
+
+#[cfg(test)]
+#[test]
+fn sharpe_ratio_flat_book_is_zero() {
+    let flat = [10000.0, 10000.0, 10000.0, 10000.0];
+    let events: Vec<Event> = flat
+        .iter()
+        .map(|b| Event::WalletUpdate {
+            datetime: DateTime::default(),
+            pnl: 0.0,
+            fees: 0.0,
+            free: *b,
+            locked: 0.0,
+            balance: *b,
+        })
+        .collect();
+    let metrics = Metrics::new(events, 10000.0, 10000.0, 0.0, 0.0);
+    assert_eq!(metrics.sharpe_ratio(0.0), 0.0); // zero std: undefined, reported as 0.0
 }
 
 #[cfg(test)]
@@ -518,4 +657,132 @@ fn wallet_equity_values_the_open_position() {
     wallet.set_unrealized_pnl(0.0);
     assert_eq!(wallet.balance(), 100.0);
     assert_eq!(wallet.equity(), 100.0);
+}
+
+// ---- M2/M3/M4/M5: pnl, Sharpe, net PF/WR, balance = equity ----
+//
+// The audit's cases, on the same 1000.00 account. `round_trip` buys `qty` at the first
+// close and closes everything at `exit` on the last bar; fees are 0.1% a side, the
+// audit's number.
+
+#[cfg(test)]
+fn round_trip(closes: &[f64], qty: f64, exit: f64, fees: bool) -> Backtest {
+    use chrono::{Duration, TimeZone};
+
+    let candles: Vec<Candle> = closes
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| {
+            let t = Utc.timestamp_opt(1_600_000_000 + i as i64 * 3600, 0).unwrap();
+            CandleBuilder::builder()
+                .open(c)
+                .high(c)
+                .low(c)
+                .close(c)
+                .volume(1.0)
+                .bid(0.0)
+                .open_time(t)
+                .close_time(t + Duration::hours(1))
+                .build()
+                .unwrap()
+        })
+        .collect();
+    let n = candles.len();
+
+    let fees = if fees { Some((0.1, 0.1)) } else { None };
+    let mut bt = Backtest::new(std::sync::Arc::from(candles), 1000.0, fees).unwrap();
+    let mut i = 0;
+    bt.run(|bt, candle| {
+        if i == 0 {
+            bt.place_order(candle, (OrderType::Market(closes[0]), qty, OrderSide::Buy).into())?;
+        }
+        if i + 1 == n {
+            let last = bt.positions().last().copied();
+            if let Some(p) = last {
+                bt.close_position(candle, &p, exit, true)?;
+            }
+        }
+        i += 1;
+        Ok(())
+    })
+    .unwrap();
+    bt
+}
+
+#[cfg(test)]
+#[test]
+fn pnl_is_equity_minus_initial_on_a_closed_book() {
+    let bt = round_trip(&[100.0, 105.0, 110.0], 9.0, 110.0, false);
+    let m = Metrics::from(&bt);
+    assert_eq!(bt.total_balance(), 1090.0);
+    assert_eq!(m.pnl(), 90.0); // was 0.00: it read unrealized_pnl of a closed book
+    assert_eq!(m.balance(), 1090.0);
+}
+
+#[cfg(test)]
+#[test]
+fn balance_is_equity_while_a_position_is_open() {
+    // 9 @ 100 held to 110, never closed: cash 100, equity 1090
+    let bt = hold_through(&[100.0, 105.0, 110.0], 9.0);
+    let m = Metrics::from(&bt);
+    assert_eq!(bt.balance(), 100.0); // cash, by definition
+    assert_eq!(m.balance(), 1090.0); // was 100.00: it read cash (M5)
+    assert_eq!(m.pnl(), 90.0);
+}
+
+#[cfg(test)]
+#[test]
+fn sharpe_is_annualised_off_the_bar_clock() {
+    let bt = round_trip(&[100.0, 105.0, 110.0], 9.0, 110.0, false);
+    let m = Metrics::from(&bt);
+    let periods = m.periods_per_year().expect("hourly stamps");
+    assert!((periods - 365.25 * 24.0).abs() < 1.0, "periods {periods}");
+    let ratio = m.sharpe_ratio(0.0) / m.sharpe_ratio_per_bar(0.0);
+    assert!((ratio - periods.sqrt()).abs() < 1e-9, "ratio {ratio}");
+}
+
+#[cfg(test)]
+#[test]
+fn sharpe_is_size_invariant() {
+    // the same +10% path at 9% and at 90% notional: same returns, same Sharpe
+    let small = round_trip(&[100.0, 105.0, 110.0], 0.9, 110.0, false);
+    let large = round_trip(&[100.0, 105.0, 110.0], 9.0, 110.0, false);
+    let (a, b) = (Metrics::from(&small), Metrics::from(&large));
+    let (a, b) = (a.sharpe_ratio(0.0), b.sharpe_ratio(0.0));
+    // 10× the notional, 10× the returns: the ratio may only move by compounding noise
+    assert!((a - b).abs() / a.abs() < 1e-2, "{a} vs {b}");
+}
+
+#[cfg(test)]
+#[test]
+fn profit_factor_and_win_rate_are_net_of_fees() {
+    // gross flat at 100.0, 1.80 of fees: a loss of 1.80, so no gains
+    let bt = round_trip(&[100.0, 101.0, 100.0], 9.0, 100.0, true);
+    let m = Metrics::from(&bt);
+    assert!((m.fees() - 1.8).abs() < 1e-9);
+    assert!((m.pnl() + 1.8).abs() < 1e-9);
+    assert_eq!(m.profit_factor(), 0.0); // was inf on a gross-flat trade
+    assert_eq!(m.win_rate(), 0.0);
+}
+
+#[cfg(test)]
+#[test]
+fn break_even_after_fees_is_not_an_infinite_profit_factor() {
+    // gross +1.80 exactly eats 1.80 of fees: the trade is flat, so PF is 0.0, not inf
+    let bt = round_trip(&[100.0, 101.0, 100.2], 9.0, 100.2, true);
+    let m = Metrics::from(&bt);
+    assert!((m.fees() - 1.8).abs() < 1e-9);
+    assert!(m.pnl().abs() < 1e-9);
+    assert_eq!(m.profit_factor(), 0.0);
+    assert_eq!(m.win_rate(), 0.0);
+}
+
+#[cfg(test)]
+#[test]
+fn a_net_winner_still_scores_as_one() {
+    let bt = round_trip(&[100.0, 105.0, 110.0], 9.0, 110.0, true);
+    let m = Metrics::from(&bt);
+    assert!((m.pnl() - (90.0 - 1.8)).abs() < 1e-9, "pnl {}", m.pnl());
+    assert_eq!(m.win_rate(), 100.0);
+    assert!(m.profit_factor().is_infinite()); // gains, no losses
 }

@@ -277,12 +277,18 @@ impl Backtest {
         // the cash left `balance` but not the account: it is now a position held at cost,
         // marked to the bar close by `execute_positions`
         self.wallet.add_open_cost(cost);
+        #[allow(unused_mut)]
+        let mut position = position;
         if let Some((market_fee, limit_fee)) = self.market_fees {
-            if position.is_market_type() {
-                self.wallet.sub_fees(cost * market_fee)?;
+            let fee = if position.is_market_type() {
+                cost * market_fee
             } else {
-                self.wallet.sub_fees(cost * limit_fee)?;
+                cost * limit_fee
             };
+            self.wallet.sub_fees(fee)?;
+            // the trade, not just the wallet, carries what it cost to open
+            #[cfg(feature = "metrics")]
+            position.add_fees(fee);
         }
         self.positions.push_back(position);
         #[cfg(feature = "metrics")]
@@ -357,21 +363,40 @@ impl Backtest {
         self.wallet.add(total_amount)?;
         // the position leaves the book at its exit value; cash arrived instead
         self.wallet.sub_open_cost(position.cost()?);
-        self.wallet.sub_pnl(total_amount);
-        if let Some((market_fee, limit_fee)) = self.market_fees {
-            if position.is_market_type() {
-                self.wallet.sub_fees(position.cost()? * market_fee)?;
-            } else {
-                self.wallet.sub_fees(position.cost()? * limit_fee)?;
-            };
+        let exit_fee = match self.market_fees {
+            Some((market_fee, limit_fee)) => {
+                if position.is_market_type() {
+                    position.cost()? * market_fee
+                } else {
+                    position.cost()? * limit_fee
+                }
+            }
+            None => 0.0,
+        };
+        if exit_fee > 0.0 {
+            self.wallet.sub_fees(exit_fee)?;
         }
+        // re-mark from the book that is left: the unrealized figure is a function of
+        // the open positions, never an accumulator that has to be unwound on a close
+        self.remark(exit_price)?;
         #[cfg(feature = "metrics")]
         {
             let mut _position = *position;
             _position.set_exit_price(exit_price)?;
+            _position.add_fees(exit_fee);
             self.events.push(Event::DelPosition(_candle.open_time(), _position));
         }
         Ok(pnl)
+    }
+
+    /// Sets the wallet's unrealized P&L from the open positions marked at `price`.
+    fn remark(&mut self, price: f64) -> Result<()> {
+        let mut total = 0.0;
+        for position in &self.positions {
+            total += position.estimate_pnl(price)?;
+        }
+        self.wallet.set_unrealized_pnl(total);
+        Ok(())
     }
 
     /// Closes all open positions at the given exit price.
@@ -516,6 +541,8 @@ impl Backtest {
         }
 
         self.positions.append(&mut positions);
+        // mark from the whole book once it is back together; `close_position` inside the
+        // loop above could only see the positions it had not yet re-queued
         self.wallet.set_unrealized_pnl(total_unrealized_pnl);
         Ok(())
     }
